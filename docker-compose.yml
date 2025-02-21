@@ -1,0 +1,17 @@
+services:
+  ferrapi:
+    build: .
+    container_name: ferrapi_tester_dev
+    volumes:
+      - .:/app            # ホストのプロジェクトルートを /app にマウント
+      - cargo-cache:/usr/local/cargo/registry  # キャッシュ用ボリューム
+    working_dir: /app
+    command: /bin/bash    # 起動時にシェルを開く
+    tty: true             # TTYを有効にする
+    stdin_open: true      # 標準入力をオープンにする
+    ports:
+      - "8080:8080"       # 必要に応じてポート公開
+
+volumes:
+  cargo-cache:
+
