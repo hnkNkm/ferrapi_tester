@@ -1,15 +1,20 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 use directories::UserDirs;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::HashMap, fs, path::PathBuf, time::Duration};
+use std::{
+    collections::HashMap,
+    fs,
+    path::PathBuf,
+    time::Duration,
+};
 
 /// FerrAPI Tester - A CLI API testing tool.
 /// このツールはHTTPリクエストの設定をコマンドラインで指定し、
 /// 必要に応じて設定を保存・読み込みしてAPIのテストを行います。
-/// TARGET（名前空間）が指定されなければ、--url だけでAPI呼び出しを行います。
+/// TARGET（名前空間）が指定されなければ、--url のみでAPI呼び出しを行います。
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Args {
@@ -44,6 +49,15 @@ struct Args {
     /// TARGET: URLまたは保存済み設定の名前空間パス（例: "https://api.example.com" または "SystemA/example"）
     /// 省略された場合は、--url のみでAPIを呼び出します。
     target: Option<String>,
+
+    /// TARGET（名前空間）に保存されている設定を削除するフラグ（ファイル単位）
+    #[arg(long = "delete")]
+    delete: bool,
+
+    /// Delete the entire namespace directory and its contents.
+    /// 例: `ferrapi_tester --delete-all SystemB` で ~/.ferrapi_tester/SystemB 以下全体を削除
+    #[arg(long = "delete-all")]
+    delete_all: bool,
 }
 
 /// 設定ファイルに保存するためのリクエスト設定。
@@ -60,17 +74,52 @@ struct RequestConfig {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // TARGET が指定されていれば保存／読み込みモード
+    // --delete-all オプションが指定された場合、TARGETに対応するディレクトリごと削除して終了する
+    if args.delete_all {
+        if let Some(ref target) = args.target {
+            let base_dir = get_default_dir()?;
+            let namespace_dir = base_dir.join(target);
+            if namespace_dir.exists() {
+                fs::remove_dir_all(&namespace_dir)
+                    .with_context(|| format!("Failed to delete namespace directory {:?}", namespace_dir))?;
+                println!("Namespace directory {:?} deleted.", namespace_dir);
+            } else {
+                println!("No namespace directory found at {:?}", namespace_dir);
+            }
+            return Ok(());
+        } else {
+            bail!("--delete-all requires TARGET to be specified.");
+        }
+    }
+
+    // --delete オプションが指定された場合（ファイル単位削除）
+    if args.delete {
+        if let Some(ref target) = args.target {
+            let base_dir = get_default_dir()?;
+            let config_path = get_config_path(&base_dir, target, &args.method);
+            if config_path.exists() {
+                fs::remove_file(&config_path)
+                    .with_context(|| format!("Failed to delete configuration at {:?}", config_path))?;
+                println!("Configuration at {:?} deleted.", config_path);
+            } else {
+                println!("No configuration found at {:?}", config_path);
+            }
+            return Ok(());
+        } else {
+            bail!("--delete requires TARGET to be specified.");
+        }
+    }
+
+    // 通常のAPI呼び出しモード
+    // TARGET が指定されている場合は保存／読み込みモード、指定がない場合は直接実行モード
     let use_saved_config = args.target.is_some();
-    
-    // TARGET が直接URLで始まる場合は、保存用としても直接実行用としてもURLとして扱う
     let target_is_url = args
         .target
         .as_ref()
         .map(|t| t.starts_with("http"))
         .unwrap_or(false);
 
-    // --url オプションが指定されていれば優先し、なければTARGETがURLならその値を使う
+    // --url オプションが指定されていれば優先し、そうでなければTARGETがURLならその値を使う
     let url_to_use = if let Some(url) = args.url {
         url
     } else if target_is_url {
@@ -79,9 +128,8 @@ async fn main() -> Result<()> {
         String::new()
     };
 
-    // 保存設定または直接実行かを判定
+    // 保存済み設定をロードする場合、または直接実行用の初期設定を作成する
     let mut config = if use_saved_config && !target_is_url {
-        // TARGET が名前空間として指定されている場合
         let base_dir = get_default_dir()?;
         let config_path = get_config_path(&base_dir, args.target.as_ref().unwrap(), &args.method);
         if config_path.exists() {
@@ -93,11 +141,10 @@ async fn main() -> Result<()> {
             RequestConfig::default()
         }
     } else {
-        // TARGET が指定されず、もしくは直接URLの場合は初期状態の構成を作成
         RequestConfig::default()
     };
 
-    // CLIで指定された値で上書き・マージする
+    // CLIで指定された値で設定を上書き・マージする
     config.method = Some(args.method.to_uppercase());
     if !url_to_use.is_empty() {
         config.url = Some(url_to_use);
@@ -137,21 +184,19 @@ async fn main() -> Result<()> {
         }
     }
 
-    // API呼び出し
+    // APIリクエストの実行
     let url = config.url.as_ref().context("URL is not specified")?;
     let client = Client::builder()
         .timeout(Duration::from_secs(config.timeout.unwrap_or(30)))
         .build()?;
-
     let mut request_builder = match config.method.as_deref() {
         Some("GET") => client.get(url),
         Some("POST") => client.post(url),
         Some("PUT") => client.put(url),
         Some("DELETE") => client.delete(url),
-        Some(other) => anyhow::bail!("Unsupported HTTP method: {}", other),
-        None => anyhow::bail!("HTTP method is not specified"),
+        Some(other) => bail!("Unsupported HTTP method: {}", other),
+        None => bail!("HTTP method is not specified"),
     };
-
     if let Some(headers) = config.headers {
         for (key, value) in headers {
             request_builder = request_builder.header(key, value);
@@ -160,7 +205,6 @@ async fn main() -> Result<()> {
     if let Some(data) = config.data {
         request_builder = request_builder.json(&data);
     }
-
     let response = request_builder.send().await?;
     let status = response.status();
     let text = response.text().await?;
@@ -170,7 +214,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// ユーザーのホームディレクトリ下のデフォルト設定ディレクトリを返す。
+/// ユーザーのホームディレクトリ下のデフォルト設定ディレクトリ（例: ~/.ferrapi_tester）を返す。
 fn get_default_dir() -> Result<PathBuf> {
     if let Some(user_dirs) = UserDirs::new() {
         Ok(user_dirs.home_dir().join(".ferrapi_tester"))
@@ -179,13 +223,13 @@ fn get_default_dir() -> Result<PathBuf> {
     }
 }
 
-/// 保存用の設定ファイルパスを組み立てる。例: ~/.ferrapi_tester/SystemA/example/POST.json
+/// 設定ファイルのパスを組み立てる。例: ~/.ferrapi_tester/SystemA/example/POST.json
 fn get_config_path(base_dir: &PathBuf, target: &str, method: &str) -> PathBuf {
     let method_file = format!("{}.json", method.to_uppercase());
     base_dir.join(target).join(method_file)
 }
 
-/// "Key: Value" 形式のヘッダー文字列をパースして HashMap に変換する。
+/// "Key: Value" 形式のヘッダー文字列を解析して HashMap に変換する。
 fn parse_headers(headers: &[String]) -> Result<HashMap<String, String>> {
     let mut map = HashMap::new();
     for header in headers {
