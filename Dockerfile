@@ -1,4 +1,4 @@
-FROM rust:1.66
+FROM rust:latest
 
 # 必要なパッケージ (git, bash-completion) をインストール
 RUN apt-get update && apt-get install -y \
