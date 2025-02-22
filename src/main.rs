@@ -1,24 +1,168 @@
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{Parser, CommandFactory, ValueHint};
+use clap_complete::{generate, Shell};
+use clap::builder::{PossibleValue, TypedValueParser};
+use dialoguer::{Select, Confirm};
 use directories::UserDirs;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
+    env,
     fs,
+    io,
     path::PathBuf,
     time::Duration,
 };
 
-/// FerrAPI Tester - A CLI API testing tool.
-/// このツールはHTTPリクエストの設定をコマンドラインで指定し、
-/// 必要に応じて設定を保存・読み込みしてAPIのテストを行います。
-/// TARGET（名前空間）が指定されなければ、--url のみでAPI呼び出しを行います。
+#[derive(Clone, Debug)]
+struct Namespace(String);
+
+impl std::str::FromStr for Namespace {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Namespace(s.to_string()))
+    }
+}
+
+impl std::fmt::Display for Namespace {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Clone)]
+struct NamespaceValueParser;
+
+impl TypedValueParser for NamespaceValueParser {
+    type Value = Namespace;
+
+    fn parse_ref(
+        &self,
+        _cmd: &clap::Command,
+        _arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<Self::Value, clap::Error> {
+        value
+            .to_str()
+            .map(|s| Namespace(s.to_string()))
+            .ok_or_else(|| {
+                clap::Error::raw(clap::error::ErrorKind::InvalidValue, "Invalid namespace")
+            })
+    }
+
+    // ここでは、静的な補完候補として、~/.ferrapi_tester 配下のトップレベルのディレクトリを返す
+    fn possible_values(&self) -> Option<Box<dyn Iterator<Item = PossibleValue> + 'static>> {
+        let base_dir = match get_default_dir() {
+            Ok(path) => path,
+            Err(_) => return None,
+        };
+        let entries = match fs::read_dir(&base_dir) {
+            Ok(entries) => entries,
+            Err(_) => return None,
+        };
+        let values: Vec<PossibleValue> = entries.filter_map(|entry| {
+            if let Ok(entry) = entry {
+                if entry.file_type().ok()?.is_dir() {
+                    if let Ok(name) = entry.file_name().into_string() {
+                        let leaked: &'static str = Box::leak(name.into_boxed_str());
+                        Some(PossibleValue::new(leaked))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }).collect();
+        Some(Box::new(values.into_iter()))
+    }
+}
+
+impl Namespace {
+    fn value_parser() -> impl TypedValueParser<Value = Self> {
+        NamespaceValueParser
+    }
+}
+
+/// 対話モードで名前空間を選択する関数
+fn interactive_select_namespace() -> Result<String> {
+    let base_dir = get_default_dir()?;
+    let mut current = base_dir.clone();
+    loop {
+        let entries: Vec<PathBuf> = fs::read_dir(&current)?
+            .filter_map(|entry| {
+                if let Ok(entry) = entry {
+                    if entry.file_type().ok()?.is_dir() {
+                        Some(entry.path())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if entries.is_empty() {
+            break;
+        }
+        // 候補のディレクトリ名一覧（相対パス）
+        let mut candidates: Vec<String> = entries.iter()
+            .filter_map(|p| p.file_name().and_then(|os_str| os_str.to_str()).map(|s| s.to_string()))
+            .collect();
+        candidates.sort();
+        let selection = Select::new()
+            .with_prompt(format!("Select a namespace in {}", current.display()))
+            .items(&candidates)
+            .default(0)
+            .interact()?;
+        // 更新: 現在のディレクトリを選択したサブディレクトリに変更
+        current = entries[selection].clone();
+        // サブディレクトリがさらに存在するか確認
+        let sub_entries: Vec<PathBuf> = fs::read_dir(&current)?
+            .filter_map(|entry| {
+                if let Ok(entry) = entry {
+                    if entry.file_type().ok()?.is_dir() {
+                        Some(entry.path())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if sub_entries.is_empty() {
+            break;
+        }
+        // ユーザーに、さらに深い階層を選択するか確認
+        if !Confirm::new()
+            .with_prompt("Do you want to select a subdirectory further?")
+            .default(true)
+            .interact()? {
+            break;
+        }
+    }
+    // 最終的な選択結果を、base_dir からの相対パスとして返す
+    let rel = current.strip_prefix(&base_dir)
+        .unwrap_or(&current)
+        .to_string_lossy()
+        .to_string();
+    Ok(rel)
+}
+
+/// FerrAPI Tester - API テスト用 CLI ツール
+///
+/// このツールは、HTTP リクエストの設定をコマンドラインで指定し、
+/// 必要に応じて設定を保存・読み込みして API のテストを行います。
+/// TARGET（名前空間）が指定されなければ、--url オプションのみで API を呼び出します。
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Args {
-    /// HTTPメソッド (GET, POST, PUT, DELETE, etc.) [default: GET]
+    /// HTTP メソッド (GET, POST, PUT, DELETE, etc.) [default: GET]
     #[arg(short = 'X', long = "request", default_value = "GET")]
     method: String,
 
@@ -30,15 +174,15 @@ struct Args {
     #[arg(short = 'd', long = "data")]
     data: Option<String>,
 
-    /// JSON形式でのリクエストボディ（-v を使う場合、保存済み設定とマージします）
+    /// JSON 形式でのリクエストボディ（-v を使う場合、保存済み設定とマージします）
     #[arg(short = 'v', long = "value")]
     value: Option<String>,
 
-    /// リクエスト先のURL。このURLは保存する際にも使用されます。
+    /// リクエスト先の URL。この URL は保存する際にも使用されます。
     #[arg(short = 'u', long = "url")]
     url: Option<String>,
 
-    /// タイムアウト秒数（デフォルトは30秒）
+    /// タイムアウト秒数（デフォルトは 30 秒）
     #[arg(long = "timeout", default_value = "30")]
     timeout: u64,
 
@@ -46,18 +190,32 @@ struct Args {
     #[arg(short = 's', long = "save")]
     save: bool,
 
-    /// TARGET: URLまたは保存済み設定の名前空間パス（例: "https://api.example.com" または "SystemA/example"）
-    /// 省略された場合は、--url のみでAPIを呼び出します。
+    /// TARGET: 保存済み設定の名前空間パス（例: "SystemA/example"）。
+    /// 省略された場合は、--url のみで API を呼び出します。
+    /// 対話モードで選択する場合は --comp オプションを利用してください。
+    #[arg(last = true, value_hint = ValueHint::DirPath)]
     target: Option<String>,
 
     /// TARGET（名前空間）に保存されている設定を削除するフラグ（ファイル単位）
     #[arg(long = "delete")]
     delete: bool,
 
-    /// Delete the entire namespace directory and its contents.
+    /// 指定した名前空間ディレクトリとその内容全体を削除するオプション。
     /// 例: `ferrapi_tester --delete-all SystemB` で ~/.ferrapi_tester/SystemB 以下全体を削除
     #[arg(long = "delete-all")]
     delete_all: bool,
+
+    /// 対話モードで名前空間候補を表示して選択します。
+    #[arg(long = "comp")]
+    comp: bool,
+
+    /// シェル補完スクリプトを生成します (bash, zsh, fish, etc.)
+    #[arg(long = "completions")]
+    completions: Option<Shell>,
+
+    /// デフォルト設定ディレクトリを表示します。
+    #[arg(long = "show-default-dir")]
+    show_default_dir: bool,
 }
 
 /// 設定ファイルに保存するためのリクエスト設定。
@@ -72,9 +230,30 @@ struct RequestConfig {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
 
-    // --delete-all オプションが指定された場合、TARGETに対応するディレクトリごと削除して終了する
+    // --show-default-dir が指定された場合、デフォルト設定ディレクトリを表示して終了
+    if args.show_default_dir {
+        let dir = get_default_dir()?;
+        println!("Default configuration directory: {:?}", dir);
+        return Ok(());
+    }
+
+    // --completions オプションが指定された場合、補完スクリプトを生成して出力し終了
+    if let Some(shell) = args.completions {
+        let mut cmd = Args::command();
+        generate(shell, &mut cmd, "ferrapi_tester", &mut io::stdout());
+        return Ok(());
+    }
+
+    // --comp オプションが指定された場合、対話モードで名前空間を選択
+    if args.comp {
+        let selected = interactive_select_namespace()?;
+        println!("Selected namespace: {}", selected);
+        args.target = Some(selected);
+    }
+
+    // --delete-all オプションが指定された場合、TARGET に対応するディレクトリ全体を削除して終了
     if args.delete_all {
         if let Some(ref target) = args.target {
             let base_dir = get_default_dir()?;
@@ -92,7 +271,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // --delete オプションが指定された場合（ファイル単位削除）
+    // --delete オプションが指定された場合（ファイル単位の削除）
     if args.delete {
         if let Some(ref target) = args.target {
             let base_dir = get_default_dir()?;
@@ -110,8 +289,8 @@ async fn main() -> Result<()> {
         }
     }
 
-    // 通常のAPI呼び出しモード
-    // TARGET が指定されている場合は保存／読み込みモード、指定がない場合は直接実行モード
+    // 通常の API 呼び出しモード
+    // TARGET が指定されている場合は保存／読み込みモード、指定がない場合は --url のみで実行
     let use_saved_config = args.target.is_some();
     let target_is_url = args
         .target
@@ -119,7 +298,6 @@ async fn main() -> Result<()> {
         .map(|t| t.starts_with("http"))
         .unwrap_or(false);
 
-    // --url オプションが指定されていれば優先し、そうでなければTARGETがURLならその値を使う
     let url_to_use = if let Some(url) = args.url {
         url
     } else if target_is_url {
@@ -128,7 +306,6 @@ async fn main() -> Result<()> {
         String::new()
     };
 
-    // 保存済み設定をロードする場合、または直接実行用の初期設定を作成する
     let mut config = if use_saved_config && !target_is_url {
         let base_dir = get_default_dir()?;
         let config_path = get_config_path(&base_dir, args.target.as_ref().unwrap(), &args.method);
