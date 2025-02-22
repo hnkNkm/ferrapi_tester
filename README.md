@@ -106,30 +106,6 @@ ferrapi_tester --delete-all SystemB
 
 This command removes the entire `SystemB` directory under `~/.ferrapi_tester`.
 
-### Shell Completions
-
-Generate shell completion scripts for your preferred shell using the `--completions` option.
-
-#### Bash Example
-
-```bash
-mkdir -p ~/.bash_completion
-ferrapi_tester --completions bash > ~/.bash_completion/ferrapi_tester
-``` 
-
-Then, add the following to your `~/.bashrc`:
-
-```bash
-if [ -f ~/.bash_completion/ferrapi_tester ]; then
-  . ~/.bash_completion/ferrapi_tester
-fi
-``` 
-
-Reload your bash configuration:
-
-```bash
-source ~/.bashrc
-``` 
 
 ### Example Command: Saving a Request
 
