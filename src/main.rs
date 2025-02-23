@@ -1,7 +1,5 @@
 use anyhow::{bail, Context, Result};
-use clap::{Parser, CommandFactory, ValueHint};
-use clap_complete::{generate, Shell};
-use clap::builder::{PossibleValue, TypedValueParser};
+use clap::{Parser, ValueHint};
 use dialoguer::{Select, Confirm};
 use directories::UserDirs;
 use reqwest::Client;
@@ -9,86 +7,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
-    env,
     fs,
-    io,
     path::PathBuf,
     time::Duration,
 };
 
-#[derive(Clone, Debug)]
-struct Namespace(String);
-
-impl std::str::FromStr for Namespace {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Namespace(s.to_string()))
-    }
-}
-
-impl std::fmt::Display for Namespace {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-#[derive(Clone)]
-struct NamespaceValueParser;
-
-impl TypedValueParser for NamespaceValueParser {
-    type Value = Namespace;
-
-    fn parse_ref(
-        &self,
-        _cmd: &clap::Command,
-        _arg: Option<&clap::Arg>,
-        value: &std::ffi::OsStr,
-    ) -> Result<Self::Value, clap::Error> {
-        value
-            .to_str()
-            .map(|s| Namespace(s.to_string()))
-            .ok_or_else(|| {
-                clap::Error::raw(clap::error::ErrorKind::InvalidValue, "Invalid namespace")
-            })
-    }
-
-    // ここでは、静的な補完候補として、~/.ferrapi_tester 配下のトップレベルのディレクトリを返す
-    fn possible_values(&self) -> Option<Box<dyn Iterator<Item = PossibleValue> + 'static>> {
-        let base_dir = match get_default_dir() {
-            Ok(path) => path,
-            Err(_) => return None,
-        };
-        let entries = match fs::read_dir(&base_dir) {
-            Ok(entries) => entries,
-            Err(_) => return None,
-        };
-        let values: Vec<PossibleValue> = entries.filter_map(|entry| {
-            if let Ok(entry) = entry {
-                if entry.file_type().ok()?.is_dir() {
-                    if let Ok(name) = entry.file_name().into_string() {
-                        let leaked: &'static str = Box::leak(name.into_boxed_str());
-                        Some(PossibleValue::new(leaked))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        }).collect();
-        Some(Box::new(values.into_iter()))
-    }
-}
-
-impl Namespace {
-    fn value_parser() -> impl TypedValueParser<Value = Self> {
-        NamespaceValueParser
-    }
-}
-
-/// 対話モードで名前空間を選択する関数
+/// Interactive mode for recursively selecting a namespace.
 fn interactive_select_namespace() -> Result<String> {
     let base_dir = get_default_dir()?;
     let mut current = base_dir.clone();
@@ -147,14 +71,42 @@ fn interactive_select_namespace() -> Result<String> {
         }
     }
     // 最終的な選択結果を、base_dir からの相対パスとして返す
-    let rel = current.strip_prefix(&base_dir)
+    let rel = current.strip_prefix(&get_default_dir()?)
         .unwrap_or(&current)
         .to_string_lossy()
         .to_string();
     Ok(rel)
 }
 
-/// FerrAPI Tester - API テスト用 CLI ツール
+/// Returns the default configuration directory (e.g., ~/.ferrapi_tester).
+fn get_default_dir() -> Result<PathBuf> {
+    if let Some(user_dirs) = UserDirs::new() {
+        Ok(user_dirs.home_dir().join(".ferrapi_tester"))
+    } else {
+        bail!("Could not determine user home directory")
+    }
+}
+
+/// Constructs the configuration file path. Example: ~/.ferrapi_tester/SystemA/example/POST.json
+fn get_config_path(base_dir: &PathBuf, target: &str, method: &str) -> PathBuf {
+    let method_file = format!("{}.json", method.to_uppercase());
+    base_dir.join(target).join(method_file)
+}
+
+/// Parses header strings in "Key: Value" format into a HashMap.
+fn parse_headers(headers: &[String]) -> Result<HashMap<String, String>> {
+    let mut map = HashMap::new();
+    for header in headers {
+        let parts: Vec<&str> = header.splitn(2, ':').collect();
+        if parts.len() != 2 {
+            bail!("Invalid header format: {}", header);
+        }
+        map.insert(parts[0].trim().to_string(), parts[1].trim().to_string());
+    }
+    Ok(map)
+}
+
+/// FerrAPI Tester - API testing CLI tool.
 ///
 /// このツールは、HTTP リクエストの設定をコマンドラインで指定し、
 /// 必要に応じて設定を保存・読み込みして API のテストを行います。
@@ -175,8 +127,12 @@ struct Args {
     data: Option<String>,
 
     /// JSON 形式でのリクエストボディ（-v を使う場合、保存済み設定とマージします）
-    #[arg(short = 'v', long = "value")]
+    #[arg(short = 'v', long = "value", conflicts_with = "json")]
     value: Option<String>,
+
+    /// JSON 形式でのリクエストボディ（-j を使う場合、-v と競合します）
+    #[arg(short = 'j', long = "json", conflicts_with = "value")]
+    json: Option<String>,
 
     /// リクエスト先の URL。この URL は保存する際にも使用されます。
     #[arg(short = 'u', long = "url")]
@@ -192,7 +148,7 @@ struct Args {
 
     /// TARGET: 保存済み設定の名前空間パス（例: "SystemA/example"）。
     /// 省略された場合は、--url のみで API を呼び出します。
-    /// 対話モードで選択する場合は --comp オプションを利用してください。
+    /// ValueHint::DirPath により、シェルのネイティブ補完が働きます。
     #[arg(last = true, value_hint = ValueHint::DirPath)]
     target: Option<String>,
 
@@ -209,16 +165,11 @@ struct Args {
     #[arg(long = "comp")]
     comp: bool,
 
-    /// シェル補完スクリプトを生成します (bash, zsh, fish, etc.)
-    #[arg(long = "completions")]
-    completions: Option<Shell>,
-
     /// デフォルト設定ディレクトリを表示します。
     #[arg(long = "show-default-dir")]
     show_default_dir: bool,
 }
 
-/// 設定ファイルに保存するためのリクエスト設定。
 #[derive(Serialize, Deserialize, Debug, Default)]
 struct RequestConfig {
     url: Option<String>,
@@ -236,13 +187,6 @@ async fn main() -> Result<()> {
     if args.show_default_dir {
         let dir = get_default_dir()?;
         println!("Default configuration directory: {:?}", dir);
-        return Ok(());
-    }
-
-    // --completions オプションが指定された場合、補完スクリプトを生成して出力し終了
-    if let Some(shell) = args.completions {
-        let mut cmd = Args::command();
-        generate(shell, &mut cmd, "ferrapi_tester", &mut io::stdout());
         return Ok(());
     }
 
@@ -270,7 +214,6 @@ async fn main() -> Result<()> {
             bail!("--delete-all requires TARGET to be specified.");
         }
     }
-
     // --delete オプションが指定された場合（ファイル単位の削除）
     if args.delete {
         if let Some(ref target) = args.target {
@@ -297,7 +240,6 @@ async fn main() -> Result<()> {
         .as_ref()
         .map(|t| t.starts_with("http"))
         .unwrap_or(false);
-
     let url_to_use = if let Some(url) = args.url {
         url
     } else if target_is_url {
@@ -321,7 +263,6 @@ async fn main() -> Result<()> {
         RequestConfig::default()
     };
 
-    // CLIで指定された値で設定を上書き・マージする
     config.method = Some(args.method.to_uppercase());
     if !url_to_use.is_empty() {
         config.url = Some(url_to_use);
@@ -337,12 +278,16 @@ async fn main() -> Result<()> {
             Ok(v) => config.data = Some(v),
             Err(_) => config.data = Some(json!(val)),
         }
+    } else if let Some(ref j) = args.json {
+        match serde_json::from_str::<Value>(j) {
+            Ok(v) => config.data = Some(v),
+            Err(_) => config.data = Some(json!(j)),
+        }
     } else if let Some(ref data) = args.data {
         config.data = Some(json!(data));
     }
     config.timeout = Some(args.timeout);
 
-    // 保存フラグがあり、かつTARGETが指定されている場合のみ、設定をファイルに保存する
     if args.save {
         if let Some(ref target) = args.target {
             let base_dir = get_default_dir()?;
@@ -361,7 +306,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    // APIリクエストの実行
     let url = config.url.as_ref().context("URL is not specified")?;
     let client = Client::builder()
         .timeout(Duration::from_secs(config.timeout.unwrap_or(30)))
@@ -389,32 +333,4 @@ async fn main() -> Result<()> {
     println!("Response Body:\n{}", text);
 
     Ok(())
-}
-
-/// ユーザーのホームディレクトリ下のデフォルト設定ディレクトリ（例: ~/.ferrapi_tester）を返す。
-fn get_default_dir() -> Result<PathBuf> {
-    if let Some(user_dirs) = UserDirs::new() {
-        Ok(user_dirs.home_dir().join(".ferrapi_tester"))
-    } else {
-        anyhow::bail!("Could not determine user home directory")
-    }
-}
-
-/// 設定ファイルのパスを組み立てる。例: ~/.ferrapi_tester/SystemA/example/POST.json
-fn get_config_path(base_dir: &PathBuf, target: &str, method: &str) -> PathBuf {
-    let method_file = format!("{}.json", method.to_uppercase());
-    base_dir.join(target).join(method_file)
-}
-
-/// "Key: Value" 形式のヘッダー文字列を解析して HashMap に変換する。
-fn parse_headers(headers: &[String]) -> Result<HashMap<String, String>> {
-    let mut map = HashMap::new();
-    for header in headers {
-        let parts: Vec<&str> = header.splitn(2, ':').collect();
-        if parts.len() != 2 {
-            anyhow::bail!("Invalid header format: {}", header);
-        }
-        map.insert(parts[0].trim().to_string(), parts[1].trim().to_string());
-    }
-    Ok(map)
 }
